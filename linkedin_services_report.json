@@ -1,0 +1,44 @@
+{
+  "timestamp": "2025-08-23T16:17:09.453036",
+  "api_key_used": "68b51a37...98cc",
+  "total_services_tested": 7,
+  "working_services_count": 0,
+  "working_services": [],
+  "failed_services": [
+    {
+      "name": "LinkedIn Data API",
+      "host": "linkedin-data-api.p.rapidapi.com",
+      "signup_url": "https://rapidapi.com/rockapis/api/linkedin-data-api/"
+    },
+    {
+      "name": "LinkedIn Profiles",
+      "host": "linkedin-profiles1.p.rapidapi.com",
+      "signup_url": "https://rapidapi.com/tommorias/api/linkedin-profiles1/"
+    },
+    {
+      "name": "Fresh LinkedIn Profile Data",
+      "host": "fresh-linkedin-profile-data.p.rapidapi.com",
+      "signup_url": "https://rapidapi.com/freshdata/api/fresh-linkedin-profile-data/"
+    },
+    {
+      "name": "LinkedIn Scraper",
+      "host": "linkedin-scraper-api.p.rapidapi.com",
+      "signup_url": "https://rapidapi.com/dataflow-kit/api/linkedin-scraper-api/"
+    },
+    {
+      "name": "LinkedIn API",
+      "host": "linkedin-api8.p.rapidapi.com",
+      "signup_url": "https://rapidapi.com/resume-parser/api/linkedin-api8/"
+    },
+    {
+      "name": "RealTime LinkedIn Company Data",
+      "host": "realtime-linkedin-company-data.p.rapidapi.com",
+      "signup_url": "https://rapidapi.com/letscrape-6bea/api/realtime-linkedin-company-data/"
+    },
+    {
+      "name": "LinkedIn Company Data",
+      "host": "linkedin-company-data.p.rapidapi.com",
+      "signup_url": "https://rapidapi.com/scrapfly/api/linkedin-company-data/"
+    }
+  ]
+}

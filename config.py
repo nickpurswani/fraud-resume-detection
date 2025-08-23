@@ -15,6 +15,7 @@ class Config:
     # API Keys (use environment variables)
     GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
     LINKEDIN_API_KEY = os.getenv('LINKEDIN_API_KEY', '')
+    BRIGHTDATA_API_KEY = os.getenv('BRIGHTDATA_API_KEY', '')
 
     # Gemini AI Configuration
     GEMINI_MODEL = "gemini-1.5-flash"
@@ -86,6 +87,12 @@ class Config:
     LINKEDIN_BASE_URL = "https://api.linkedin.com/v2"
     LINKEDIN_TIMEOUT = 30
 
+    # Bright Data LinkedIn Configuration
+    BRIGHTDATA_BASE_URL = "https://api.brightdata.com/datasets/v3"
+    BRIGHTDATA_DATASET_ID = "gd_l1viktl72bvl7bjuj0"
+    BRIGHTDATA_TIMEOUT = 60
+    BRIGHTDATA_INCLUDE_ERRORS = True
+
     # Database Configuration (if needed)
     DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///fraud_detection.db')
 
@@ -100,7 +107,8 @@ class Config:
     # Rate Limiting
     API_RATE_LIMIT = {
         'gemini': 60,  # requests per minute
-        'linkedin': 100  # requests per hour
+        'linkedin': 100,  # requests per hour
+        'brightdata': 50  # requests per hour
     }
 
     # Common Job Descriptions (for plagiarism detection)
@@ -124,6 +132,9 @@ class Config:
 
         if not cls.LINKEDIN_API_KEY:
             warnings.append("LinkedIn API key not provided - profile verification disabled")
+
+        if not cls.BRIGHTDATA_API_KEY:
+            warnings.append("Bright Data API key not provided - advanced LinkedIn data collection disabled")
 
         # Check thresholds
         for key, value in cls.FRAUD_THRESHOLDS.items():
@@ -151,6 +162,17 @@ class Config:
     def get_fraud_threshold(cls, fraud_type: str) -> float:
         """Get fraud threshold for specific type"""
         return cls.FRAUD_THRESHOLDS.get(fraud_type, 0.7)
+
+    @classmethod
+    def get_brightdata_config(cls) -> Dict[str, Any]:
+        """Get Bright Data configuration"""
+        return {
+            'api_key': cls.BRIGHTDATA_API_KEY,
+            'base_url': cls.BRIGHTDATA_BASE_URL,
+            'dataset_id': cls.BRIGHTDATA_DATASET_ID,
+            'timeout': cls.BRIGHTDATA_TIMEOUT,
+            'include_errors': cls.BRIGHTDATA_INCLUDE_ERRORS
+        }
 
 # Create a global config instance
 config = Config()

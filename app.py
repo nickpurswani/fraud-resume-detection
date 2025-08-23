@@ -18,12 +18,14 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import base64
 from typing import Dict, List, Any, Optional
+import time
 
 # Import our fraud detection modules
 try:
     from src.fraud_detector import FraudDetector, FraudFlag, RiskLevel
     from src.nlp_analyzer import NLPAnalyzer
     from src.linkedin_verifier import LinkedInVerifier
+    from src.brightdata_linkedin_fixed import BrightDataLinkedInFixed
     from src.fit_scorer import FitScorer
     from src.report_generator import ReportGenerator, ReportFormat
     from src.utils import TextExtractor, validate_file_upload, create_sample_data
@@ -111,7 +113,15 @@ if 'current_candidate' not in st.session_state:
 @st.cache_resource
 def initialize_components():
     """Initialize fraud detection components"""
+    detector = None
+    linkedin_verifier = None
+    brightdata_service = None
+    fit_scorer = None
+    report_generator = None
+    text_extractor = None
+
     try:
+        # Initialize config first
         config = Config()
         validation_result = config.validate_config()
 
@@ -119,20 +129,54 @@ def initialize_components():
             for warning in validation_result['warnings']:
                 st.sidebar.warning(warning)
 
+        if not validation_result['valid']:
+            for issue in validation_result['issues']:
+                st.error(f"Configuration issue: {issue}")
+            return None, None, None, None, None, None
+
+        # Initialize components
         detector = FraudDetector(config.__dict__)
         linkedin_verifier = LinkedInVerifier(config.LINKEDIN_API_KEY, config.__dict__)
+
+        # Initialize Bright Data service (optional)
+        try:
+            if Config.BRIGHTDATA_API_KEY:
+                brightdata_service = BrightDataLinkedInFixed()
+            else:
+                brightdata_service = None
+        except Exception as bd_error:
+            st.sidebar.warning(f"Bright Data service unavailable: {bd_error}")
+            brightdata_service = None
+
         fit_scorer = FitScorer(config.__dict__)
         report_generator = ReportGenerator(config.__dict__)
         text_extractor = TextExtractor()
 
-        return detector, linkedin_verifier, fit_scorer, report_generator, text_extractor
+        return detector, linkedin_verifier, brightdata_service, fit_scorer, report_generator, text_extractor
+
     except Exception as e:
         st.error(f"Error initializing components: {e}")
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
-detector, linkedin_verifier, fit_scorer, report_generator, text_extractor = initialize_components()
+detector, linkedin_verifier, brightdata_service, fit_scorer, report_generator, text_extractor = initialize_components()
 
-if not all([detector, fit_scorer, report_generator, text_extractor]):
+# Check which components failed to initialize
+failed_components = []
+if detector is None:
+    failed_components.append("Fraud Detector")
+if linkedin_verifier is None:
+    failed_components.append("LinkedIn Verifier")
+if fit_scorer is None:
+    failed_components.append("Fit Scorer")
+if report_generator is None:
+    failed_components.append("Report Generator")
+if text_extractor is None:
+    failed_components.append("Text Extractor")
+# Note: brightdata_service is optional, so we don't include it in failed_components check
+
+if failed_components:
+    st.error("❌ **Critical Error: Application cannot start**")
+    st.error(f"The following components failed to initialize: {', '.join(failed_components)}")
     st.stop()
 
 def main():
@@ -299,10 +343,40 @@ def single_candidate_analysis():
     st.subheader("🔗 LinkedIn Profile (Optional)")
     linkedin_url = st.text_input("LinkedIn Profile URL:", placeholder="https://www.linkedin.com/in/username")
 
+    # LinkedIn service selection
+    linkedin_service_option = None
+    skip_linkedin = st.checkbox("⚡ Skip LinkedIn verification (faster analysis)", value=False,
+                               help="Skip LinkedIn verification if you want faster analysis or if experiencing issues")
+
+    if linkedin_url and not skip_linkedin:
+        st.write("**LinkedIn Service:**")
+        linkedin_service_option = st.radio(
+            "Choose LinkedIn data service:",
+            ["Traditional LinkedIn API", "Bright Data (Recommended)"],
+            help="Bright Data provides more comprehensive and reliable LinkedIn data extraction",
+            key="single_linkedin_service"
+        )
+
+        # Service status indicators
+        col_status1, col_status2 = st.columns(2)
+        with col_status1:
+            if linkedin_verifier:
+                st.success("✅ Traditional LinkedIn API: Available")
+            else:
+                st.error("❌ Traditional LinkedIn API: Not configured")
+        with col_status2:
+            if brightdata_service:
+                st.success("✅ Bright Data: Available")
+            else:
+                st.error("❌ Bright Data: Not configured")
+    elif skip_linkedin:
+        st.info("🚀 LinkedIn verification will be skipped for faster analysis")
+
     st.subheader("🔧 Analysis Options")
     col1, col2, col3 = st.columns(3)
     with col1:
-        include_linkedin = st.checkbox("LinkedIn Verification", value=bool(linkedin_url))
+        include_linkedin = st.checkbox("LinkedIn Verification", value=bool(linkedin_url and not skip_linkedin),
+                                     disabled=skip_linkedin)
     with col2:
         include_fit = st.checkbox("Job Fit Analysis", value=bool(job_description))
 
@@ -318,11 +392,12 @@ def single_candidate_analysis():
 
         # Run analysis
         run_single_analysis(resume_text, candidate_name, job_description, linkedin_url,
-                            include_linkedin=include_linkedin, include_fit=include_fit)
+                            include_linkedin=include_linkedin and not skip_linkedin,
+                            include_fit=include_fit, linkedin_service_option=linkedin_service_option)
 
 def run_single_analysis(resume_text, candidate_name, job_description=None,
                        linkedin_url=None, include_nlp=True, include_linkedin=False,
-                       include_fit=False):
+                       include_fit=False, linkedin_service_option=None):
     """Run comprehensive analysis on a single candidate"""
 
     progress_bar = st.progress(0)
@@ -344,49 +419,131 @@ def run_single_analysis(resume_text, candidate_name, job_description=None,
 
         # Step 2: LinkedIn verification
         linkedin_results = None
-        if include_linkedin and linkedin_verifier and linkedin_url:
+        if include_linkedin and linkedin_url:
             status_text.text("🔗 Verifying LinkedIn profile...")
             progress_bar.progress(40)
 
-            try:
-                # Extract name for LinkedIn search
-                personal_info = analysis_results.get('detailed_analysis', {}).get('nlp', {}).get('analysis_results', {}).get('personal_info', {})
-                names = personal_info.get('names', [candidate_name])
-                search_name = names[0] if names else candidate_name
+            # Add timeout mechanism
+            linkedin_timeout_container = st.empty()
+            linkedin_start_time = time.time()
+            linkedin_max_time = 300  # 5 minutes max for LinkedIn
 
-                profiles = linkedin_verifier.search_profile_by_name(search_name)
-                if profiles:
-                    profile = linkedin_verifier.get_profile_details(profiles[0]['id'])
-                    if profile:
-                        linkedin_results = linkedin_verifier.verify_against_resume(
-                            analysis_results.get('detailed_analysis', {}).get('structured_info', {}),
-                            profile
-                        )
+            try:
+                if linkedin_service_option == "Bright Data (Recommended)" and brightdata_service:
+                    # Use Bright Data service with timeout
+                    status_text.text("🚀 Starting Bright Data extraction...")
+                    progress_bar.progress(45)
+
+                    linkedin_timeout_container.info("⏳ LinkedIn verification may take 1-5 minutes using advanced data extraction.")
+
+                    # Progress callback for single analysis
+                    def single_progress_callback(message, percent):
+                        progress_bar.progress(45 + int(percent * 0.1))  # Scale to 45-55%
+
+                    # Extract profile using fixed Bright Data service
+                    try:
+                        profile = brightdata_service.extract_single_profile(linkedin_url, single_progress_callback)
+
+                        linkedin_elapsed = time.time() - linkedin_start_time
+                        if linkedin_elapsed > linkedin_max_time:
+                            st.warning("⏰ LinkedIn verification timed out. Continuing without LinkedIn data.")
+                            linkedin_timeout_container.empty()
+                        elif profile.success:
+                            status_text.text("⚖️ Comparing LinkedIn data with resume...")
+                            progress_bar.progress(50)
+
+                            structured_info = analysis_results.get('detailed_analysis', {}).get('structured_info', {})
+                            linkedin_results = brightdata_service.verify_against_resume(profile, structured_info)
+                            linkedin_results['service_used'] = 'Bright Data Fixed'
+                            linkedin_results['profile_data'] = profile
+                            linkedin_timeout_container.empty()
+                            st.success(f"✅ LinkedIn verification completed in {linkedin_elapsed:.1f}s")
+                        else:
+                            linkedin_timeout_container.empty()
+                            st.warning(f"⚠️ Bright Data LinkedIn extraction failed: {profile.error}")
+                    except Exception as bd_error:
+                        linkedin_timeout_container.empty()
+                        st.error(f"❌ Bright Data service error: {str(bd_error)}")
+                        st.info("💡 Try using 'Skip LinkedIn verification' option for faster analysis")
+
+                elif linkedin_verifier:
+                    # Use traditional LinkedIn API
+                    linkedin_timeout_container.info("⏳ Using traditional LinkedIn API...")
+
+                    personal_info = analysis_results.get('detailed_analysis', {}).get('nlp', {}).get('analysis_results', {}).get('personal_info', {})
+                    names = personal_info.get('names', [candidate_name])
+                    search_name = names[0] if names else candidate_name
+
+                    profiles = linkedin_verifier.search_profile_by_name(search_name)
+                    if profiles:
+                        profile = linkedin_verifier.get_profile_details(profiles[0]['id'])
+                        if profile:
+                            linkedin_results = linkedin_verifier.verify_against_resume(
+                                analysis_results.get('detailed_analysis', {}).get('structured_info', {}),
+                                profile
+                            )
+                            linkedin_results['service_used'] = 'Traditional API'
+                            linkedin_timeout_container.empty()
+                            st.success("✅ Traditional LinkedIn API verification completed")
+                    else:
+                        linkedin_timeout_container.empty()
+                        st.warning("⚠️ No LinkedIn profiles found with traditional API")
+                else:
+                    linkedin_timeout_container.empty()
+                    st.warning("⚠️ No LinkedIn service is configured or available.")
+                    st.info("💡 Configure LINKEDIN_API_KEY or BRIGHTDATA_API_KEY, or use 'Skip LinkedIn verification'")
+
             except Exception as e:
-                st.warning(f"LinkedIn verification failed: {e}")
+                linkedin_timeout_container.empty()
+                st.error(f"❌ LinkedIn verification failed: {e}")
+                st.info("💡 Try using 'Skip LinkedIn verification' option to continue analysis")
+                with st.expander("🔍 Error Details"):
+                    st.code(str(e))
+        elif include_linkedin and not linkedin_url:
+            st.warning("⚠️ LinkedIn verification requested but no URL provided")
 
         # Step 3: Job fit analysis
         fit_results = None
         if include_fit and job_description:
             status_text.text("📊 Analyzing job fit...")
-            progress_bar.progress(60)
+            progress_bar.progress(65 if include_linkedin else 60)
 
             try:
-                fit_analysis = fit_scorer.calculate_fit_score(
-                    analysis_results.get('detailed_analysis', {}).get('structured_info', {}),
-                    job_description
-                )
-                fit_results = {
-                    'overall_score': fit_analysis.overall_score,
-                    'fit_level': fit_analysis.fit_level.value,
-                    'qualification_status': fit_analysis.qualification_status.value,
-                    'strengths': fit_analysis.strengths,
-                    'gaps': fit_analysis.gaps,
-                    'red_flags': fit_analysis.red_flags,
-                    'recommendations': fit_analysis.recommendations
-                }
+                structured_info = analysis_results.get('detailed_analysis', {}).get('structured_info', {})
+
+                if not structured_info:
+                    st.warning("No structured information available from resume analysis")
+                    fit_results = {
+                        'overall_score': 0.0,
+                        'fit_level': 'mismatch',
+                        'qualification_status': 'unqualified',
+                        'strengths': [],
+                        'gaps': ['No resume data to analyze'],
+                        'red_flags': ['Resume parsing failed'],
+                        'recommendations': ['Please ensure resume is properly formatted']
+                    }
+                else:
+                    fit_analysis = fit_scorer.calculate_fit_score(structured_info, job_description)
+                    fit_results = {
+                        'overall_score': fit_analysis.overall_score,
+                        'fit_level': fit_analysis.fit_level.value,
+                        'qualification_status': fit_analysis.qualification_status.value,
+                        'strengths': fit_analysis.strengths,
+                        'gaps': fit_analysis.gaps,
+                        'red_flags': fit_analysis.red_flags,
+                        'recommendations': fit_analysis.recommendations
+                    }
             except Exception as e:
                 st.warning(f"Fit analysis failed: {e}")
+                fit_results = {
+                    'overall_score': 0.0,
+                    'fit_level': 'mismatch',
+                    'qualification_status': 'unqualified',
+                    'strengths': [],
+                    'gaps': ['Analysis failed'],
+                    'red_flags': ['Fit calculation error'],
+                    'recommendations': ['Manual review required']
+                }
 
         # Step 4: Generate reports
         status_text.text("📋 Generating comprehensive report...")
@@ -654,30 +811,95 @@ def display_linkedin_results(linkedin_results):
         st.info("LinkedIn verification was not performed or no profile found.")
         return
 
-    verification_status = linkedin_results.get('verification_status', 'unknown')
-    match_score = linkedin_results.get('overall_match_score', 0.0)
+    # Check which service was used
+    service_used = linkedin_results.get('service_used', 'Unknown')
+    st.info(f"🔧 **Service Used:** {service_used}")
 
-    col1, col2 = st.columns(2)
+    match_score = linkedin_results.get('overall_match_score', 0.0)
+    confidence_score = linkedin_results.get('confidence_score', match_score)
+
+    # Overall results
+    col1, col2, col3 = st.columns(3)
 
     with col1:
-        if verification_status == 'verified':
-            st.success(f"✅ **Profile Verified** (Match: {match_score:.2f})")
-        elif verification_status == 'partial':
-            st.warning(f"⚠️ **Partial Match** (Score: {match_score:.2f})")
+        if match_score >= 0.8:
+            st.success(f"✅ **High Match** ({match_score:.1%})")
+        elif match_score >= 0.5:
+            st.warning(f"⚠️ **Partial Match** ({match_score:.1%})")
         else:
-            st.error(f"❌ **Verification Failed** (Score: {match_score:.2f})")
+            st.error(f"❌ **Low Match** ({match_score:.1%})")
 
     with col2:
-        st.metric("Match Score", f"{match_score:.2f}/1.0")
+        st.metric("Match Score", f"{match_score:.1%}")
 
-    # Discrepancies
+    with col3:
+        st.metric("Confidence", f"{confidence_score:.1%}")
+
+    # Handle Bright Data specific results
+    if service_used == 'Bright Data' and 'profile_data' in linkedin_results:
+        profile_data = linkedin_results['profile_data']
+
+        st.subheader("👤 LinkedIn Profile Information")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.write("**Basic Information:**")
+            st.write(f"• **Name:** {profile_data.full_name or 'N/A'}")
+            st.write(f"• **Headline:** {profile_data.headline or 'N/A'}")
+            st.write(f"• **Location:** {profile_data.location or 'N/A'}")
+            if profile_data.connections_count:
+                st.write(f"• **Connections:** {profile_data.connections_count:,}")
+
+        with col2:
+            st.write("**Profile Data:**")
+            exp_count = len(profile_data.experience) if profile_data.experience else 0
+            edu_count = len(profile_data.education) if profile_data.education else 0
+            skills_count = len(profile_data.skills) if profile_data.skills else 0
+
+            st.write(f"• **Experience:** {exp_count} positions")
+            st.write(f"• **Education:** {edu_count} entries")
+            st.write(f"• **Skills:** {skills_count} listed")
+
+    # Verification Details
+    st.subheader("🔍 Verification Details")
+    verification_data = []
+    for category, result in linkedin_results.items():
+        if category.endswith('_match') and isinstance(result, dict):
+            category_name = category.replace('_match', '').replace('_', ' ').title()
+            match_status = "✅ Match" if result.get('match') else "❌ No Match"
+            score = f"{result.get('score', 0):.1%}" if result.get('score') is not None else "N/A"
+
+            verification_data.append({
+                'Category': category_name,
+                'Status': match_status,
+                'Score': score,
+                'Details': result.get('details', 'N/A')
+            })
+
+    if verification_data:
+        df_verification = pd.DataFrame(verification_data)
+        st.dataframe(df_verification, use_container_width=True)
+
+    # Fraud Indicators
+    fraud_indicators = linkedin_results.get('fraud_indicators', [])
+    if fraud_indicators:
+        st.subheader("⚠️ Fraud Risk Indicators")
+        for indicator in fraud_indicators:
+            st.warning(f"• {indicator}")
+    else:
+        st.success("✅ No fraud indicators detected")
+
+    # Legacy discrepancies handling
     discrepancies = linkedin_results.get('discrepancies', [])
     if discrepancies:
-        st.subheader("Identified Discrepancies")
-
+        st.subheader("📋 Identified Discrepancies")
         for i, disc in enumerate(discrepancies[:5]):  # Show top 5
-            severity = getattr(disc, 'severity', 'medium')
-            description = getattr(disc, 'description', 'No description')
+            if hasattr(disc, 'severity'):
+                severity = disc.severity
+                description = getattr(disc, 'description', 'No description')
+            else:
+                severity = 'medium'
+                description = str(disc)
 
             if severity == 'critical':
                 st.error(f"🔴 {description}")
@@ -1192,6 +1414,29 @@ def linkedin_verification():
     st.header("🔗 LinkedIn Profile Verification")
     st.write("Verify candidate information against LinkedIn profiles.")
 
+    # Service selection
+    st.subheader("🛠️ LinkedIn Data Service")
+    service_option = st.radio(
+        "Choose LinkedIn data service:",
+        ["Traditional LinkedIn API", "Bright Data (Recommended)"],
+        help="Bright Data provides more comprehensive and reliable LinkedIn data extraction"
+    )
+
+    # Service status indicators
+    col_status1, col_status2 = st.columns(2)
+
+    with col_status1:
+        if linkedin_verifier:
+            st.success("✅ Traditional LinkedIn API: Available")
+        else:
+            st.error("❌ Traditional LinkedIn API: Not configured")
+
+    with col_status2:
+        if brightdata_service:
+            st.success("✅ Bright Data: Available")
+        else:
+            st.error("❌ Bright Data: Not configured")
+
     # Input options
     col1, col2 = st.columns(2)
 
@@ -1228,15 +1473,24 @@ def linkedin_verification():
 
     # Verification button
     if st.button("🔍 Verify LinkedIn Profile", type="primary"):
-        if not candidate_name:
-            st.error("Please provide a candidate name.")
+        if not candidate_name and not linkedin_url:
+            st.error("Please provide either a candidate name or LinkedIn URL.")
             return
 
         if not resume_text:
             st.error("Please provide resume information.")
             return
 
-        run_linkedin_verification(candidate_name, company_name, linkedin_url, resume_text)
+        if service_option == "Bright Data (Recommended)":
+            if not brightdata_service:
+                st.error("Bright Data service is not configured. Please set BRIGHTDATA_API_KEY environment variable.")
+                return
+            run_brightdata_verification(candidate_name, company_name, linkedin_url, resume_text)
+        else:
+            if not linkedin_verifier:
+                st.error("Traditional LinkedIn API is not configured. Please set LINKEDIN_API_KEY environment variable.")
+                return
+            run_linkedin_verification(candidate_name, company_name, linkedin_url, resume_text)
 
 
 def run_linkedin_verification(candidate_name, company_name, linkedin_url, resume_text):
@@ -1454,6 +1708,406 @@ def settings_page():
         # Save to session state (in production, save to file or database)
         st.session_state.user_settings = settings
         st.success("✅ Settings saved successfully!")
+
+
+def run_brightdata_verification(candidate_name, company_name, linkedin_url, resume_text):
+    """Run LinkedIn verification using Bright Data service with async snapshot workflow"""
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    snapshot_info_placeholder = st.empty()
+
+    try:
+        # Step 1: Parse resume
+        status_text.text("📝 Analyzing resume...")
+        progress_bar.progress(10)
+
+        fraud_analysis = detector.analyze_resume(resume_text)
+        structured_info = fraud_analysis.get('detailed_analysis', {}).get('structured_info', {})
+
+        # Step 2: Prepare URLs for extraction
+        status_text.text("🔍 Preparing LinkedIn data extraction...")
+        progress_bar.progress(20)
+
+        urls_to_extract = []
+
+        if linkedin_url:
+            # Direct URL provided
+            urls_to_extract.append(linkedin_url)
+        else:
+            # Need to search or construct URL
+            if candidate_name:
+                # For now, we'll need a direct URL for Bright Data
+                # In a real implementation, you might have a search mechanism
+                st.warning("⚠️ Bright Data requires direct LinkedIn URLs. Please provide the LinkedIn profile URL.")
+                progress_bar.empty()
+                status_text.empty()
+                return
+
+        # Step 3: Use the fixed workflow with progress callback
+        def progress_callback(message, percent):
+            """Progress callback for real-time UI updates"""
+            progress_bar.progress(int(30 + percent * 0.6))  # Scale to 30-90%
+            status_text.text(f"⏳ {message}")
+
+            # Update info placeholder
+            snapshot_info_placeholder.info(f"📊 **Bright Data Progress**\n- {message}\n- Progress: {percent:.1f}%")
+
+        # Execute the complete workflow
+        status_text.text("🚀 Starting Bright Data extraction...")
+        progress_bar.progress(30)
+
+        try:
+            result = brightdata_service.extract_profiles(urls_to_extract, progress_callback)
+
+            if not result.success:
+                st.error(f"❌ Bright Data extraction failed: {result.error}")
+                snapshot_info_placeholder.error(f"Error: {result.error}")
+                progress_bar.empty()
+                status_text.empty()
+                return
+
+            if not result.profiles or not any(p.success for p in result.profiles):
+                st.error("❌ No successful LinkedIn profile extractions.")
+                progress_bar.empty()
+                status_text.empty()
+                return
+
+            # Step 4: Verify against resume
+            status_text.text("⚖️ Comparing resume with LinkedIn data...")
+            progress_bar.progress(95)
+
+            successful_profile = next(p for p in result.profiles if p.success)
+            verification_results = brightdata_service.verify_against_resume(
+                successful_profile, structured_info
+            )
+
+            # Step 5: Complete
+            progress_bar.progress(100)
+            status_text.text("✅ Bright Data verification complete!")
+
+            # Clear progress info
+            time.sleep(1)
+            progress_bar.empty()
+            status_text.empty()
+            snapshot_info_placeholder.empty()
+
+            # Display results - convert to expected format
+            display_results = {
+                **verification_results,
+                'snapshot_id': result.snapshot_id,
+                'execution_time': result.total_time,
+                'total_profiles': len(result.profiles),
+                'successful_extractions': len([p for p in result.profiles if p.success]),
+                'failed_extractions': len([p for p in result.profiles if not p.success]),
+                'status': result.status.value,
+                'profiles': result.profiles
+            }
+
+            display_brightdata_verification_results_fixed(display_results, successful_profile)
+
+        except Exception as e:
+            st.error(f"❌ Bright Data extraction failed: {e}")
+            snapshot_info_placeholder.error(f"Unexpected error: {str(e)}")
+            progress_bar.empty()
+            status_text.empty()
+            return
+
+    except Exception as e:
+        st.error(f"Bright Data verification failed: {e}")
+        import traceback
+        with st.expander("🔍 Error Details"):
+            st.code(traceback.format_exc())
+        progress_bar.empty()
+        status_text.empty()
+        if 'snapshot_info_placeholder' in locals():
+            snapshot_info_placeholder.empty()
+
+
+def display_brightdata_verification_results(verification_results, profile, response):
+    """Display Bright Data verification results"""
+
+    st.success("✅ **LinkedIn Profile Verification Complete**")
+
+    # Overall results
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        match_score = verification_results.get('overall_match_score', 0)
+        st.metric(
+            "Overall Match Score",
+            f"{match_score:.1%}",
+            delta=f"{match_score - 0.7:.1%}" if match_score > 0.7 else f"{match_score - 0.7:.1%}"
+        )
+
+    with col2:
+        confidence = verification_results.get('confidence_score', 0)
+        st.metric("Confidence", f"{confidence:.1%}")
+
+    with col3:
+        fraud_indicators = len(verification_results.get('fraud_indicators', []))
+        st.metric(
+            "Fraud Indicators",
+            fraud_indicators,
+            delta=f"+{fraud_indicators}" if fraud_indicators > 0 else None
+        )
+
+    with col4:
+        extraction_time = response.execution_time
+        st.metric("Processing Time", f"{extraction_time:.1f}s")
+
+    # Show snapshot information
+    if response.snapshot_id:
+        st.subheader("📸 Snapshot Information")
+        col_snap1, col_snap2, col_snap3 = st.columns(3)
+
+        with col_snap1:
+            st.metric("Snapshot ID", response.snapshot_id[-12:])  # Show last 12 chars
+
+        with col_snap2:
+            if response.snapshot_info:
+                total_records = response.snapshot_info.total_records or response.total_profiles
+                st.metric("Total Records", total_records)
+
+        with col_snap3:
+            if response.snapshot_info and response.snapshot_info.completed_at:
+                completion_time = response.snapshot_info.completed_at.strftime("%H:%M:%S")
+                st.metric("Completed At", completion_time)
+
+    # Profile Information
+    st.subheader("👤 LinkedIn Profile Information")
+
+    profile_col1, profile_col2 = st.columns(2)
+
+    with profile_col1:
+        st.write("**Basic Information:**")
+        st.write(f"• **Name:** {profile.full_name or 'N/A'}")
+        st.write(f"• **Headline:** {profile.headline or 'N/A'}")
+        st.write(f"• **Location:** {profile.location or 'N/A'}")
+        st.write(f"• **Industry:** {profile.industry or 'N/A'}")
+
+        if profile.connections_count:
+            st.write(f"• **Connections:** {profile.connections_count:,}")
+        if profile.followers_count:
+            st.write(f"• **Followers:** {profile.followers_count:,}")
+
+    with profile_col2:
+        st.write("**Profile Data:**")
+        exp_count = len(profile.experience) if profile.experience else 0
+        edu_count = len(profile.education) if profile.education else 0
+        skills_count = len(profile.skills) if profile.skills else 0
+
+        st.write(f"• **Experience Entries:** {exp_count}")
+        st.write(f"• **Education Entries:** {edu_count}")
+        st.write(f"• **Skills Listed:** {skills_count}")
+
+        if profile.certifications:
+            st.write(f"• **Certifications:** {len(profile.certifications)}")
+
+    # Verification Details
+    st.subheader("🔍 Verification Details")
+
+    verification_data = []
+    for category, result in verification_results.items():
+        if category.endswith('_match') and isinstance(result, dict):
+            category_name = category.replace('_match', '').replace('_', ' ').title()
+            match_status = "✅ Match" if result['match'] else "❌ No Match"
+            score = f"{result['score']:.1%}" if result['score'] is not None else "N/A"
+
+            verification_data.append({
+                'Category': category_name,
+                'Status': match_status,
+                'Score': score,
+                'Details': result['details']
+            })
+
+    if verification_data:
+        df_verification = pd.DataFrame(verification_data)
+        st.dataframe(df_verification, use_container_width=True)
+
+    # Experience Comparison
+    if profile.experience:
+        st.subheader("💼 Experience Analysis")
+
+        exp_data = []
+        for i, exp in enumerate(profile.experience[:5]):  # Show top 5
+            exp_data.append({
+                'Position': exp.get('title', 'N/A'),
+                'Company': exp.get('company', 'N/A'),
+                'Duration': exp.get('duration', exp.get('dates', 'N/A')),
+                'Location': exp.get('location', 'N/A')
+            })
+
+        if exp_data:
+            df_experience = pd.DataFrame(exp_data)
+            st.dataframe(df_experience, use_container_width=True)
+
+    # Skills Analysis
+    if profile.skills:
+        st.subheader("🎯 Skills Analysis")
+
+        # Show skills in columns
+        skills_per_col = 10
+        num_cols = min(3, (len(profile.skills) + skills_per_col - 1) // skills_per_col)
+        cols = st.columns(num_cols)
+
+        for i, skill in enumerate(profile.skills[:30]):  # Show top 30 skills
+            col_idx = i % num_cols
+            cols[col_idx].write(f"• {skill}")
+
+    # Fraud Indicators
+    fraud_indicators = verification_results.get('fraud_indicators', [])
+    if fraud_indicators:
+        st.subheader("⚠️ Fraud Risk Indicators")
+        for indicator in fraud_indicators:
+            st.warning(f"• {indicator}")
+    else:
+        st.success("✅ No fraud indicators detected")
+
+    # Raw Data (Optional)
+    if st.checkbox("🔧 Show Raw Profile Data", help="Display the raw JSON data from Bright Data"):
+        st.json(profile.raw_data)
+
+
+def display_brightdata_verification_results_fixed(results, profile):
+    """Display results from the fixed Bright Data service"""
+
+    st.success("✅ **LinkedIn Profile Verification Complete**")
+
+    # Overall results
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        match_score = results.get('overall_match_score', 0)
+        st.metric(
+            "Overall Match Score",
+            f"{match_score:.1%}",
+            delta=f"{match_score - 0.7:.1%}" if match_score > 0.7 else f"{match_score - 0.7:.1%}"
+        )
+
+    with col2:
+        confidence = results.get('confidence_score', 0)
+        st.metric("Confidence", f"{confidence:.1%}")
+
+    with col3:
+        fraud_indicators = len(results.get('fraud_indicators', []))
+        st.metric(
+            "Fraud Indicators",
+            fraud_indicators,
+            delta=f"+{fraud_indicators}" if fraud_indicators > 0 else None
+        )
+
+    with col4:
+        extraction_time = results.get('execution_time', 0)
+        st.metric("Processing Time", f"{extraction_time:.1f}s")
+
+    # Show snapshot information
+    if results.get('snapshot_id'):
+        st.subheader("📸 Snapshot Information")
+        col_snap1, col_snap2, col_snap3 = st.columns(3)
+
+        with col_snap1:
+            st.metric("Snapshot ID", results['snapshot_id'][-12:])  # Show last 12 chars
+
+        with col_snap2:
+            total_profiles = results.get('total_profiles', 0)
+            st.metric("Total Profiles", total_profiles)
+
+        with col_snap3:
+            successful = results.get('successful_extractions', 0)
+            st.metric("Successful", successful)
+
+    # Profile Information
+    st.subheader("👤 LinkedIn Profile Information")
+
+    profile_col1, profile_col2 = st.columns(2)
+
+    with profile_col1:
+        st.write("**Basic Information:**")
+        st.write(f"• **Name:** {profile.name or 'N/A'}")
+        st.write(f"• **Headline:** {profile.headline or 'N/A'}")
+        st.write(f"• **Location:** {profile.location or 'N/A'}")
+
+        if profile.connections:
+            st.write(f"• **Connections:** {profile.connections:,}")
+
+    with profile_col2:
+        st.write("**Profile Data:**")
+        exp_count = len(profile.experience) if profile.experience else 0
+        edu_count = len(profile.education) if profile.education else 0
+        skills_count = len(profile.skills) if profile.skills else 0
+
+        st.write(f"• **Experience Entries:** {exp_count}")
+        st.write(f"• **Education Entries:** {edu_count}")
+        st.write(f"• **Skills Listed:** {skills_count}")
+
+    # Verification Details
+    st.subheader("🔍 Verification Details")
+
+    verification_results = results.get('verification_results', {})
+    if verification_results:
+        verification_data = []
+        for category, result in verification_results.items():
+            if isinstance(result, dict):
+                category_name = category.replace('_match', '').replace('_', ' ').title()
+                match_status = "✅ Match" if result.get('match') else "❌ No Match"
+                score = f"{result.get('score', 0):.1%}" if result.get('score') is not None else "N/A"
+
+                verification_data.append({
+                    'Category': category_name,
+                    'Status': match_status,
+                    'Score': score,
+                    'Details': result.get('details', 'N/A')
+                })
+
+        if verification_data:
+            df_verification = pd.DataFrame(verification_data)
+            st.dataframe(df_verification, use_container_width=True)
+
+    # Experience Analysis
+    if profile.experience:
+        st.subheader("💼 Experience Analysis")
+
+        exp_data = []
+        for i, exp in enumerate(profile.experience[:5]):  # Show top 5
+            exp_data.append({
+                'Position': exp.get('title', 'N/A'),
+                'Company': exp.get('company', 'N/A'),
+                'Duration': exp.get('duration', 'N/A'),
+                'Location': exp.get('location', 'N/A')
+            })
+
+        if exp_data:
+            df_experience = pd.DataFrame(exp_data)
+            st.dataframe(df_experience, use_container_width=True)
+
+    # Skills Analysis
+    if profile.skills:
+        st.subheader("🎯 Skills Analysis")
+
+        # Show skills in columns
+        skills_per_col = 10
+        num_cols = min(3, (len(profile.skills) + skills_per_col - 1) // skills_per_col)
+        cols = st.columns(num_cols)
+
+        for i, skill in enumerate(profile.skills[:30]):  # Show top 30 skills
+            col_idx = i % num_cols
+            cols[col_idx].write(f"• {skill}")
+
+    # Fraud Indicators
+    fraud_indicators = results.get('fraud_indicators', [])
+    if fraud_indicators:
+        st.subheader("⚠️ Fraud Risk Indicators")
+        for indicator in fraud_indicators:
+            st.warning(f"• {indicator}")
+    else:
+        st.success("✅ No fraud indicators detected")
+
+    # Raw Data (Optional)
+    if st.checkbox("🔧 Show Raw Profile Data", help="Display the raw JSON data from Bright Data"):
+        if profile.raw_data:
+            st.json(profile.raw_data)
+        else:
+            st.info("No raw data available")
 
 
 def help_documentation():

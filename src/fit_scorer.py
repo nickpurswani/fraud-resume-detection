@@ -432,7 +432,8 @@ class FitScorer:
 
         for exp in resume_experiences:
             duration = exp.duration_months if hasattr(exp, 'duration_months') else exp.get('duration_months', 0)
-            if duration:
+            # Handle None duration explicitly
+            if duration is not None and duration > 0:
                 total_years += duration / 12.0
                 relevant_experiences.append({
                     'title': exp.title if hasattr(exp, 'title') else exp.get('title', ''),
@@ -440,7 +441,11 @@ class FitScorer:
                     'years': duration / 12.0
                 })
 
-        required_years = job_experience.get('years', 0)
+        # Handle potential None values defensively
+        required_years = job_experience.get('years', 0) if job_experience else 0
+        required_years = required_years if required_years is not None else 0
+        total_years = total_years if total_years is not None else 0.0
+
         experience_gap = max(0, required_years - total_years)
 
         # Calculate experience score
@@ -559,7 +564,7 @@ class FitScorer:
         resume_text = ' '.join(resume_text_parts)
 
         # Calculate similarity using multiple methods
-        similarities = self.similarity_calc.calculate_text_similarity(resume_text, job_description)
+        similarities = self.nlp_analyzer.calculate_text_similarity(resume_text, job_description)
 
         # Use average of different similarity metrics
         semantic_score = np.mean([
@@ -686,9 +691,9 @@ class FitScorer:
 
         # Overqualification red flag
         experiences = resume_data.get('experiences', [])
-        total_years = sum(exp.duration_months/12 if hasattr(exp, 'duration_months') and exp.duration_months
-                         else exp.get('duration_months', 0)/12 for exp in experiences)
-        required_years = job_requirements.get('experience', {}).get('years', 0)
+        total_years = sum((exp.duration_months or 0)/12 if hasattr(exp, 'duration_months')
+                         else (exp.get('duration_months') or 0)/12 for exp in experiences)
+        required_years = job_requirements.get('experience', {}).get('years') or 0
 
         if required_years > 0 and total_years > required_years * 3:
             red_flags.append("Candidate may be significantly overqualified for this position")
